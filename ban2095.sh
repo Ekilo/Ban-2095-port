@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# =========================
-# 配置区（按需修改）
-# =========================
 PORT="2095"
-
-# SSH 端口保护，避免误锁自己
 SSH_PORT="${SSH_PORT:-22}"
-
-# 是否处理 IPv6：1=处理，0=跳过
 ENABLE_IPV6="${ENABLE_IPV6:-1}"
 
-# 允许访问 2095 的 IPv4 内网网段
 ALLOW_V4=(
   "127.0.0.0/8"
   "10.0.0.0/8"
@@ -20,26 +12,16 @@ ALLOW_V4=(
   "192.168.0.0/16"
 )
 
-# 允许访问 2095 的 IPv6 内网/本地网段
-# ::1 回环
-# fc00::/7 ULA（私有 IPv6）
-# fe80::/10 链路本地
 ALLOW_V6=(
   "::1/128"
   "fc00::/7"
   "fe80::/10"
 )
 
-# 自定义链名称
 CHAIN_V4="PORT_${PORT}_FILTER"
 CHAIN_V6="PORT_${PORT}_FILTER_V6"
-
-# 备份目录
 BACKUP_DIR="/root/fw-backup-${PORT}-$(date +%F_%H%M%S)"
 
-# =========================
-# 基础函数
-# =========================
 log() {
   echo "[INFO] $*"
 }
@@ -53,8 +35,120 @@ die() {
   exit 1
 }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
+need_root() {
+  [[ "${EUID}" -eq 0 ]] || die "请使用 root 或 sudo 执行此脚本"
+}
+
+need_apt() {
+  command -v apt-get >/dev/null 2>&1 || die "未检测到 apt-get，本脚本仅适用于 Debian/Ubuntu 系"
+  command -v dpkg >/dev/null 2>&1 || die "未检测到 dpkg，当前系统不适合使用此脚本"
+}
+
+is_container_like() {
+  if grep -qaE 'docker|lxc|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+    return 0
+  fi
+  [[ -f /.dockerenv ]] && return 0
+  return 1
+}
+
+install_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+
+  local need_update=0
+
+  if ! command -v iptables >/dev/null 2>&1; then
+    need_update=1
+  fi
+
+  if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+    need_update=1
+  fi
+
+  if ! dpkg -s netfilter-persistent >/dev/null 2>&1; then
+    need_update=1
+  fi
+
+  if [[ "$need_update" -eq 1 ]]; then
+    log "开始更新软件源"
+    apt-get update -y
+  else
+    log "所需软件包已存在，跳过 apt-get update"
+  fi
+
+  if ! command -v iptables >/dev/null 2>&1; then
+    log "安装 iptables"
+    apt-get install -y iptables
+  else
+    log "iptables 已安装，跳过"
+  fi
+
+  if ! dpkg -s iptables-persistent >/dev/null 2>&1 || ! dpkg -s netfilter-persistent >/dev/null 2>&1; then
+    log "安装 iptables-persistent / netfilter-persistent"
+    apt-get install -y iptables-persistent netfilter-persistent
+  else
+    log "iptables-persistent 和 netfilter-persistent 已安装，跳过"
+  fi
+
+  command -v iptables >/dev/null 2>&1 || die "iptables 安装失败"
+  command -v iptables-save >/dev/null 2>&1 || die "iptables-save 不可用"
+  command -v iptables-restore >/dev/null 2>&1 || die "iptables-restore 不可用"
+  command -v netfilter-persistent >/dev/null 2>&1 || die "netfilter-persistent 安装失败"
+
+  if [[ "$ENABLE_IPV6" == "1" ]]; then
+    command -v ip6tables >/dev/null 2>&1 || die "ip6tables 不可用，请检查安装"
+    command -v ip6tables-save >/dev/null 2>&1 || die "ip6tables-save 不可用"
+    command -v ip6tables-restore >/dev/null 2>&1 || die "ip6tables-restore 不可用"
+  fi
+}
+
+check_kernel_capability() {
+  if ! iptables -L >/dev/null 2>&1; then
+    die "当前环境无法操作 iptables。可能是容器环境未授予 NET_ADMIN 权限，或内核模块不可用"
+  fi
+
+  if [[ "$ENABLE_IPV6" == "1" ]]; then
+    if ! ip6tables -L >/dev/null 2>&1; then
+      warn "当前环境无法操作 ip6tables，自动关闭 IPv6 防火墙配置"
+      ENABLE_IPV6="0"
+    fi
+  fi
+}
+
+backup_current_rules() {
+  mkdir -p "$BACKUP_DIR"
+  iptables-save > "${BACKUP_DIR}/rules.v4.before"
+
+  if command -v ip6tables-save >/dev/null 2>&1; then
+    ip6tables-save > "${BACKUP_DIR}/rules.v6.before" 2>/dev/null || true
+  fi
+
+  cat > "${BACKUP_DIR}/restore.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ -f "${DIR}/rules.v4.before" ]]; then
+  iptables-restore < "${DIR}/rules.v4.before"
+fi
+
+if command -v ip6tables-restore >/dev/null 2>&1 && [[ -f "${DIR}/rules.v6.before" ]]; then
+  ip6tables-restore < "${DIR}/rules.v6.before" || true
+fi
+
+mkdir -p /etc/iptables
+iptables-save > /etc/iptables/rules.v4
+
+if command -v ip6tables-save >/dev/null 2>&1; then
+  ip6tables-save > /etc/iptables/rules.v6 || true
+fi
+
+systemctl restart netfilter-persistent || true
+echo "[OK] 已回滚到执行前的防火墙规则"
+EOF
+
+  chmod 700 "${BACKUP_DIR}/restore.sh"
+  log "已备份当前规则到 ${BACKUP_DIR}"
 }
 
 ipt_has_rule() {
@@ -77,85 +171,27 @@ ensure_chain_v6() {
   fi
 }
 
-append_unique_v4() {
-  local table_args=("$@")
-  if ! ipt_has_rule "${table_args[@]}"; then
-    iptables -A "${table_args[@]}"
-  fi
-}
-
-append_unique_v6() {
-  local table_args=("$@")
-  if ! ip6t_has_rule "${table_args[@]}"; then
-    ip6tables -A "${table_args[@]}"
-  fi
-}
-
-insert_unique_input_jump_v4() {
+insert_jump_v4() {
   if ! ipt_has_rule INPUT -p tcp --dport "$PORT" -j "$CHAIN_V4"; then
     iptables -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN_V4"
   fi
 }
 
-insert_unique_input_jump_v6() {
+insert_jump_v6() {
   if ! ip6t_has_rule INPUT -p tcp --dport "$PORT" -j "$CHAIN_V6"; then
     ip6tables -I INPUT 1 -p tcp --dport "$PORT" -j "$CHAIN_V6"
   fi
 }
 
-save_rules() {
-  mkdir -p /etc/iptables
-  iptables-save > /etc/iptables/rules.v4
-  if [[ "$ENABLE_IPV6" == "1" ]]; then
-    ip6tables-save > /etc/iptables/rules.v6
-  else
-    : > /etc/iptables/rules.v6
-  fi
-  systemctl enable netfilter-persistent >/dev/null 2>&1 || true
-  systemctl restart netfilter-persistent
-}
-
-backup_current_rules() {
-  mkdir -p "$BACKUP_DIR"
-  iptables-save > "${BACKUP_DIR}/rules.v4.before"
-  ip6tables-save > "${BACKUP_DIR}/rules.v6.before" || true
-
-  cat > "${BACKUP_DIR}/restore.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-DIR="$(cd "$(dirname "$0")" && pwd)"
-iptables-restore < "${DIR}/rules.v4.before"
-if command -v ip6tables-restore >/dev/null 2>&1 && [ -s "${DIR}/rules.v6.before" ]; then
-  ip6tables-restore < "${DIR}/rules.v6.before"
-fi
-iptables-save > /etc/iptables/rules.v4
-if command -v ip6tables-save >/dev/null 2>&1; then
-  ip6tables-save > /etc/iptables/rules.v6 || true
-fi
-systemctl restart netfilter-persistent || true
-echo "[OK] 已回滚到执行前规则"
-EOF
-  chmod 700 "${BACKUP_DIR}/restore.sh"
-}
-
-install_packages() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y iptables iptables-persistent netfilter-persistent
-}
-
-protect_basic_access() {
-  # 放行回环
+protect_base_rules() {
   if ! ipt_has_rule INPUT -i lo -j ACCEPT; then
     iptables -I INPUT 1 -i lo -j ACCEPT
   fi
 
-  # 放行已建立连接，避免影响现有会话
   if ! ipt_has_rule INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; then
     iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   fi
 
-  # 保护 SSH
   if ! ipt_has_rule INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT; then
     iptables -I INPUT 1 -p tcp --dport "$SSH_PORT" -j ACCEPT
   fi
@@ -164,34 +200,30 @@ protect_basic_access() {
     if ! ip6t_has_rule INPUT -i lo -j ACCEPT; then
       ip6tables -I INPUT 1 -i lo -j ACCEPT
     fi
+
     if ! ip6t_has_rule INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; then
       ip6tables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     fi
+
     if ! ip6t_has_rule INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT; then
       ip6tables -I INPUT 1 -p tcp --dport "$SSH_PORT" -j ACCEPT
     fi
   fi
 }
 
-apply_port_rules_v4() {
+apply_v4_rules() {
   ensure_chain_v4
-
-  # 清空自定义链后重建，保证内容一致
   iptables -F "$CHAIN_V4"
 
-  # 允许内网访问指定端口
   for net in "${ALLOW_V4[@]}"; do
     iptables -A "$CHAIN_V4" -p tcp -s "$net" --dport "$PORT" -j ACCEPT
   done
 
-  # 拒绝其他 IPv4 来源访问该端口
   iptables -A "$CHAIN_V4" -p tcp --dport "$PORT" -j DROP
-
-  # 将该端口流量引入自定义链
-  insert_unique_input_jump_v4
+  insert_jump_v4
 }
 
-apply_port_rules_v6() {
+apply_v6_rules() {
   [[ "$ENABLE_IPV6" == "1" ]] || return 0
 
   ensure_chain_v6
@@ -201,78 +233,94 @@ apply_port_rules_v6() {
     ip6tables -A "$CHAIN_V6" -p tcp -s "$net" --dport "$PORT" -j ACCEPT
   done
 
-  # 拒绝其他 IPv6 来源访问该端口
   ip6tables -A "$CHAIN_V6" -p tcp --dport "$PORT" -j DROP
-
-  insert_unique_input_jump_v6
+  insert_jump_v6
 }
 
-show_result() {
+save_persistent_rules() {
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4
+
+  if [[ "$ENABLE_IPV6" == "1" ]]; then
+    ip6tables-save > /etc/iptables/rules.v6
+  else
+    : > /etc/iptables/rules.v6
+  fi
+
+  systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+  systemctl restart netfilter-persistent
+}
+
+show_rules() {
   echo
-  echo "========== IPv4 规则 =========="
+  echo "========== IPv4 =========="
   iptables -S INPUT | grep -- "--dport ${PORT}" || true
   iptables -S "$CHAIN_V4" || true
 
   if [[ "$ENABLE_IPV6" == "1" ]]; then
     echo
-    echo "========== IPv6 规则 =========="
+    echo "========== IPv6 =========="
     ip6tables -S INPUT | grep -- "--dport ${PORT}" || true
     ip6tables -S "$CHAIN_V6" || true
   fi
 
   echo
-  echo "========== 持久化状态 =========="
+  echo "========== 持久化 =========="
   systemctl is-enabled netfilter-persistent || true
   systemctl --no-pager --full status netfilter-persistent | sed -n '1,12p' || true
+}
 
+show_usage_tip() {
   echo
-  echo "[OK] 配置完成"
-  echo "[OK] 备份目录: ${BACKUP_DIR}"
+  echo "[OK] 已完成配置"
+  echo "[OK] 规则备份目录: ${BACKUP_DIR}"
   echo "[OK] 回滚脚本: ${BACKUP_DIR}/restore.sh"
   echo
-  echo "建议验证："
-  echo "1. 内网主机访问 ${PORT} 应成功"
-  echo "2. 外网主机访问 ${PORT} 应失败"
-  echo "3. 本机执行: ss -lntp | grep :${PORT}"
+  echo "验证命令："
+  echo "  ss -lntp | grep :${PORT}"
+  echo "  iptables -S INPUT | grep ${PORT}"
+  echo "  iptables -S ${CHAIN_V4}"
+  if [[ "$ENABLE_IPV6" == "1" ]]; then
+    echo "  ip6tables -S INPUT | grep ${PORT}"
+    echo "  ip6tables -S ${CHAIN_V6}"
+  fi
+  echo
+  echo "内网访问 ${PORT} 应成功，外网访问 ${PORT} 应失败。"
+  echo
+  echo "如需回滚："
+  echo "  ${BACKUP_DIR}/restore.sh"
 }
 
 main() {
-  [[ "${EUID}" -eq 0 ]] || die "请用 root 执行"
-  need_cmd apt-get
-  need_cmd systemctl
+  need_root
+  need_apt
 
-  log "备份当前防火墙规则"
+  if is_container_like; then
+    warn "检测到可能是容器环境，若没有 NET_ADMIN 权限，iptables 可能无法生效"
+  fi
+
+  install_packages
+  check_kernel_capability
   backup_current_rules
 
-  log "安装 iptables / iptables-persistent / netfilter-persistent"
-  install_packages
+  log "添加基础保护规则"
+  protect_base_rules
 
-  need_cmd iptables
-  need_cmd iptables-save
-  need_cmd iptables-restore
-  need_cmd netfilter-persistent
+  log "配置 IPv4: 仅允许内网访问端口 ${PORT}"
+  apply_v4_rules
 
   if [[ "$ENABLE_IPV6" == "1" ]]; then
-    need_cmd ip6tables
-    need_cmd ip6tables-save
-    need_cmd ip6tables-restore
+    log "配置 IPv6: 仅允许内网访问端口 ${PORT}"
+    apply_v6_rules
+  else
+    warn "已跳过 IPv6 规则配置"
   fi
 
-  log "保护基础连接（lo / 已建立连接 / SSH）"
-  protect_basic_access
+  log "保存规则并启用开机持久化"
+  save_persistent_rules
 
-  log "应用 IPv4 规则"
-  apply_port_rules_v4
-
-  if [[ "$ENABLE_IPV6" == "1" ]]; then
-    log "应用 IPv6 规则"
-    apply_port_rules_v6
-  fi
-
-  log "保存并启用持久化"
-  save_rules
-
-  show_result
+  show_rules
+  show_usage_tip
 }
 
 main "$@"
